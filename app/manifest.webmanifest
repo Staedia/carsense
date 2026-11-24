@@ -1,0 +1,11 @@
+{
+  "name": "CarSense",
+  "short_name": "CarSense",
+  "description": "AI car health check from an OBD-II Bluetooth dongle",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1216",
+  "theme_color": "#0f1216",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

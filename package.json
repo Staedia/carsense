@@ -1,0 +1,12 @@
+{
+  "name": "carsense",
+  "version": "0.1.0",
+  "description": "OBD-II dongle + phone + LLM car health checker",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "demo": "node cli/demo.mjs",
+    "serve": "node cli/serve.mjs"
+  },
+  "license": "MIT"
+}
