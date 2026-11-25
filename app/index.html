@@ -50,6 +50,14 @@
       <div class="gauges" id="gauges"></div>
       <label class="tiny-check"><input type="checkbox" id="liveAll"> Show all sensors (more technical)</label>
       <p class="hint" id="liveNote" hidden></p>
+      <div class="trip-strip" id="tripStrip" hidden>
+        <div><span class="t-label">Distance</span><strong id="tripDist">0</strong></div>
+        <div><span class="t-label">Time</span><strong id="tripTime">0:00</strong></div>
+        <div><span class="t-label">Fuel</span><strong id="tripFuel">–</strong></div>
+        <div><span class="t-label">Cost</span><strong id="tripCost">–</strong></div>
+      </div>
+      <button class="btn wide" id="tripBtn">Start trip</button>
+      <p class="hint" id="tripHint" hidden>Keep this screen open while you drive. Phones pause web apps in the background.</p>
     </section>
 
     <section class="card" id="batteryCard" hidden>
@@ -87,6 +95,26 @@
     </section>
 
     <section id="reportCard" hidden></section>
+
+    <section class="card" id="tripsCard" hidden>
+      <div class="card-head">
+        <h2>Trips</h2>
+        <button class="link-btn" id="tripsExport">Export CSV</button>
+      </div>
+      <div id="tripsTotals" class="hint"></div>
+      <ul class="trip-list" id="tripsList"></ul>
+      <button class="link-btn danger" id="tripsClear">Delete all trips</button>
+    </section>
+
+    <section class="card" id="lookupCard">
+      <h2>Look up a trouble code</h2>
+      <form class="lookup-row" id="lookupForm">
+        <input id="lookupInput" type="text" placeholder="e.g. P0420" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false">
+        <button class="btn" type="submit">Look up</button>
+      </form>
+      <div id="lookupResult"></div>
+      <p class="hint">Works offline. Covers the common generic codes; manufacturer-specific codes (P1xxx etc.) need your car maker's list.</p>
+    </section>
 
     <details class="card raw" id="rawWrap" hidden>
       <summary>Data sent to the AI</summary>
@@ -143,14 +171,19 @@
       </fieldset>
 
       <fieldset>
-        <legend>Units</legend>
+        <legend>Units and fuel</legend>
         <label for="fuelUnit">Fuel economy</label>
         <select id="fuelUnit">
           <option value="l100km">L/100 km</option>
-          <option value="mpg_uk">mpg (UK)</option>
-          <option value="mpg_us">mpg (US)</option>
+          <option value="mpg_uk">mpg (UK) and miles</option>
+          <option value="mpg_us">mpg (US) and miles</option>
           <option value="kml">km/L</option>
         </select>
+        <div class="grid2">
+          <div><label for="fuelPrice">Fuel price per litre</label><input id="fuelPrice" type="number" min="0" step="0.01" inputmode="decimal" placeholder="e.g. 1.95"></div>
+          <div><label for="currency">Currency symbol</label><input id="currency" type="text" maxlength="3" placeholder="$"></div>
+        </div>
+        <p class="hint">Used to work out what each trip cost.</p>
       </fieldset>
 
       <div class="btn-row end">

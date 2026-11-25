@@ -10,6 +10,9 @@ import { FuelTracker, formatEconomy } from './core/fuel.js';
 import { runBatteryTest, assessBattery } from './core/battery.js';
 import { analyze, DEFAULT_SETTINGS } from './core/analyze.js';
 import { misfireOutlier } from './core/rules.js';
+import { explainDtc } from './core/dtc-library.js';
+import { describeFreezeFrame } from './core/freeze-frame.js';
+import { TripRecorder, tripCost, tripTotals, tripsCsv } from './core/trip.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -20,6 +23,8 @@ const defaults = {
   ...DEFAULT_SETTINGS,
   openaiKey: '',
   fuelUnit: 'l100km',
+  fuelPrice: null,
+  currency: '$',
   duration: 60,
   vehicle: { make: 'MG', model: 'ZS', year: 2019, fuel: 'petrol' },
 };
@@ -46,6 +51,9 @@ let checkAbort = null;
 let batteryAbort = null;
 let batteryResult = null; // last battery test this session, added to the health check
 let vin = null;
+let trip = null; // TripRecorder while a trip is being logged
+let tripTimer = null;
+let wakeLock = null;
 
 // ---------- gauges ----------
 // Each gauge shows one reading key (or a derived value). `pids` are what it
@@ -114,6 +122,7 @@ function livePids() {
   const pids = new Set(visibleGauges().flatMap((g) => [...g.pids, ...(g.poll || [])]));
   if (visibleGauges().some((g) => g.id === 'fuel_economy')) FUEL_PIDS.forEach((p) => pids.add(p));
   pids.add(0x0c); // RPM tells us if the engine is running (battery gauge)
+  if (trip) [0x0d, ...FUEL_PIDS].forEach((p) => pids.add(p));
   return [...pids];
 }
 
@@ -150,7 +159,9 @@ function setGauge(id, valueHtml, sub, lvl) {
 function updateGauge(key, value, _pid, track = true) {
   if (track) {
     lastValues[key] = value;
-    fuel.update(key, value, performance.now() / 1000);
+    const t = performance.now() / 1000;
+    fuel.update(key, value, t);
+    trip?.update(key, value, t);
   }
   for (const g of [...SIMPLE_GAUGES, ...DETAIL_GAUGES]) {
     if (!g.keys.includes(key)) continue;
@@ -191,6 +202,7 @@ function setConnectedUI(connected) {
   $('disconnectBtn').hidden = !connected;
   $('liveCard').hidden = !connected;
   $('batteryCard').hidden = !connected;
+  renderTrips();
   $('checkCard').hidden = !connected;
   $('demoRow').hidden = !(connected && mode === 'demo');
 }
@@ -264,6 +276,7 @@ async function startDemo(scenarioKey = $('scenario').value || 'healthy') {
 }
 
 function handleDisconnect() {
+  if (trip) finishTrip();
   liveAbort?.abort();
   checkAbort?.abort();
   batteryAbort?.abort();
@@ -286,6 +299,7 @@ async function disconnect() {
 
 // ---------- live view ----------
 async function stopLive() {
+  if (trip) finishTrip();
   if (!liveAbort) return;
   liveAbort.abort();
   try { await livePromise; } catch { /* aborted */ }
@@ -296,17 +310,178 @@ async function stopLive() {
 
 async function toggleLive() {
   if (liveAbort) return stopLive();
-  liveAbort = new AbortController();
+  const mine = new AbortController();
+  liveAbort = mine;
   $('liveBtn').textContent = 'Stop live view';
   fuel.reset();
   livePromise = collectLive(elm, {
-    pids: livePids(), durationSec: Infinity, signal: liveAbort.signal, onSample: updateGauge, minCycleMs: 400,
+    pids: livePids(), durationSec: Infinity, signal: mine.signal, onSample: updateGauge, minCycleMs: 400,
   }).catch((e) => {
-    if (e.name !== 'AbortError') showError(e.message);
+    if (e.name === 'AbortError') return;
+    showError(e.message);
+    if (trip) finishTrip(); // polling failed (e.g. dongle lost): save what we have
   });
   await livePromise;
-  liveAbort = null;
-  $('liveBtn').textContent = 'Start live view';
+  // Only tidy up if a newer live view hasn't already replaced this one.
+  if (liveAbort === mine) {
+    liveAbort = null;
+    $('liveBtn').textContent = 'Start live view';
+  }
+}
+
+// ---------- trips ----------
+const TRIPS_KEY = 'carsense.trips.v1';
+function loadTrips() {
+  try { return JSON.parse(localStorage.getItem(TRIPS_KEY) || '[]'); } catch { return []; }
+}
+function saveTrips(list) {
+  try { localStorage.setItem(TRIPS_KEY, JSON.stringify(list.slice(0, 300))); } catch { /* storage full or blocked */ }
+}
+
+const useMiles = () => String(settings.fuelUnit).startsWith('mpg');
+function fmtDist(km) {
+  return useMiles() ? `${(km / 1.609344).toFixed(1)} mi` : `${km.toFixed(1)} km`;
+}
+function fmtDuration(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
+const fmtMoney = (v) => (v == null ? '–' : `${settings.currency || ''}${v.toFixed(2)}`);
+const price = () => (Number(settings.fuelPrice) > 0 ? Number(settings.fuelPrice) : null);
+
+async function keepAwake(on) {
+  try {
+    if (on && 'wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen');
+    if (!on) { await wakeLock?.release(); wakeLock = null; }
+  } catch { /* not supported or refused: the hint tells the driver to keep the screen on */ }
+}
+
+async function startTrip() {
+  showError('');
+  trip = new TripRecorder({ fuel: settings.vehicle.fuel });
+  $('tripBtn').textContent = 'End trip';
+  $('tripBtn').classList.add('primary');
+  $('tripStrip').hidden = false;
+  $('tripHint').hidden = false;
+  $('checkBtn').disabled = true;
+  $('battBtn').disabled = true;
+  keepAwake(true);
+  tripTimer = setInterval(renderTripStrip, 1000);
+  renderTripStrip();
+  if (liveAbort) {
+    // Restart polling so speed and fuel sensors are included.
+    await stopLiveOnly();
+  }
+  toggleLive();
+}
+
+// Stop polling without ending the trip (used when restarting the live view).
+async function stopLiveOnly() {
+  const t = trip;
+  trip = null;
+  await stopLive();
+  trip = t;
+}
+
+function renderTripStrip() {
+  if (!trip) return;
+  const s = trip.summary();
+  $('tripDist').textContent = fmtDist(s.distanceKm);
+  $('tripTime').textContent = fmtDuration(s.durationSec);
+  $('tripFuel').textContent = s.litres == null ? '–' : `${s.litres.toFixed(2)} L`;
+  $('tripCost').textContent = fmtMoney(tripCost(s.litres, price()));
+}
+
+function finishTrip() {
+  const t = trip;
+  trip = null;
+  clearInterval(tripTimer);
+  keepAwake(false);
+  $('tripBtn').textContent = 'Start trip';
+  $('tripBtn').classList.remove('primary');
+  $('tripStrip').hidden = true;
+  $('tripHint').hidden = true;
+  $('checkBtn').disabled = false;
+  $('battBtn').disabled = false;
+  const s = t.summary();
+  if (s.durationSec < 10) return; // tapped by mistake
+  const saved = { ...s, pricePerLitre: price(), cost: tripCost(s.litres, price()), fuelType: settings.vehicle.fuel };
+  saveTrips([saved, ...loadTrips()]);
+  renderTrips();
+}
+
+async function toggleTrip() {
+  if (trip) {
+    finishTrip();
+    await stopLive();
+  } else {
+    await startTrip();
+  }
+}
+
+function renderTrips() {
+  const list = loadTrips();
+  $('tripsCard').hidden = !list.length && !elm;
+  const tot = tripTotals(list);
+  const eco = formatEconomy(tot.l100km, settings.fuelUnit);
+  $('tripsTotals').textContent = list.length
+    ? `${tot.count} trip${tot.count > 1 ? 's' : ''} · ${fmtDist(tot.distanceKm)} · ${fmtDuration(tot.durationSec)}`
+      + (eco ? ` · average ${eco.value} ${eco.unit}` : '') + (tot.cost ? ` · ${fmtMoney(tot.cost)} of fuel` : '')
+    : 'No trips yet. Tap "Start trip" in the live data card when you set off.';
+  $('tripsList').innerHTML = list.slice(0, 30).map((t, i) => {
+    const e = formatEconomy(t.l100km, settings.fuelUnit);
+    const when = new Date(t.startedAt).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    const bits = [fmtDuration(t.durationSec), e ? `${e.value} ${e.unit}` : null, t.litres != null ? `${t.litres.toFixed(2)} L` : null, t.cost != null ? fmtMoney(t.cost) : null,
+      t.idleSec >= 60 ? `${Math.round(t.idleSec / 60)} min idling` : null].filter(Boolean);
+    return `<li>
+      <span class="tr-main">${esc(when)} · ${esc(fmtDist(t.distanceKm))}</span>
+      <span class="tr-sub">${esc(bits.join(' · '))}</span>
+      <button class="tr-del" data-i="${i}" aria-label="Delete trip">×</button>
+    </li>`;
+  }).join('');
+  $('tripsExport').hidden = !list.length;
+  $('tripsClear').hidden = !list.length;
+}
+
+function exportTrips() {
+  const blob = new Blob([tripsCsv(loadTrips())], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `carsense-trips-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ---------- trouble code explanations (offline) ----------
+const DRIVE_TEXT = { yes: 'Yes, but get it looked at.', 'with caution': 'With caution. Get it checked soon.', no: 'No. Stop as soon as it is safe.' };
+
+function codeDetails(code, { pending = false, open = false } = {}) {
+  const info = explainDtc(code) || { code, title: 'Unknown code', family: null };
+  const f = info.family;
+  const sev = f?.severity ? `<span class="sev ${esc(f.severity)}">${esc(info.severityLabel)}</span>` : '';
+  const body = f ? `
+      <p><strong>${esc(f.name)}.</strong> ${esc(f.meaning)}</p>
+      ${f.causes.length ? `<p class="muted">Common causes: ${esc(f.causes.join('; '))}.</p>` : ''}
+      ${f.checks.length ? `<p>What to check:</p><ol class="checks">${f.checks.map((c) => `<li>${esc(c)}</li>`).join('')}</ol>` : ''}
+      ${f.drive ? `<p><strong>Safe to drive?</strong> ${esc(DRIVE_TEXT[f.drive])}</p>` : ''}
+      ${f.note ? `<p class="muted">${esc(f.note)}</p>` : ''}`
+    : `<p class="muted">This code isn't in the offline library. It's a ${esc(info.kind || '')} code; look it up for your exact make and model.</p>`;
+  return `<details class="code-item"${open ? ' open' : ''}>
+    <summary><span class="code${pending ? ' pending' : ''}">${esc(code)}${pending ? ' · pending' : ''}</span><span class="c-title">${esc(info.title)}</span>${sev}</summary>
+    <div class="code-body">${pending ? '<p class="muted">Pending: the car has seen this once but not confirmed it yet.</p>' : ''}${body}</div>
+  </details>`;
+}
+
+function lookupCode(e) {
+  e.preventDefault();
+  const info = explainDtc($('lookupInput').value);
+  $('lookupResult').innerHTML = info
+    ? codeDetails(info.code, { open: true })
+    : '<p class="note">Enter a code like P0420: a letter (P, C, B or U) and four digits.</p>';
 }
 
 // ---------- health check ----------
@@ -445,9 +620,10 @@ function renderBatteryResult(a) {
 
 function renderReport(r, summary) {
   const badgeIcon = { Good: '●', Watch: '▲', 'Needs attention': '■' }[r.status];
+  const storedCodes = summary.trouble_codes.stored.map((c) => c.code);
   const codes = [
-    ...summary.trouble_codes.stored.map((c) => `<span class="code" title="${esc(c.description)}">${esc(c.code)}</span>`),
-    ...summary.trouble_codes.pending.map((c) => `<span class="code pending" title="Pending: ${esc(c.description)}">${esc(c.code)} · pending</span>`),
+    ...storedCodes.map((c) => codeDetails(c)),
+    ...summary.trouble_codes.pending.map((c) => c.code).filter((c) => !storedCodes.includes(c)).map((c) => codeDetails(c, { pending: true })),
   ].join('');
   const drive = { yes: 'Yes', 'with caution': 'With caution', no: 'No' }[r.safe_to_drive];
   const source = r.source === 'ai'
@@ -463,7 +639,8 @@ function renderReport(r, summary) {
         ${r.safety_warning ? `<div class="safety">⚠ ${esc(r.safety_warning)}</div>` : ''}
       </div>
       <div class="report-body">
-        ${codes ? `<h3>Trouble codes</h3><div class="codes">${codes}</div>` : ''}
+        ${codes ? `<h3>Trouble codes <span class="muted">(tap for details)</span></h3>${codes}` : ''}
+        ${freezeFrameHtml(summary.freeze_frame)}
         ${r.likely_causes.length ? `<h3>Likely causes</h3>${r.likely_causes.map((c) => `
           <div class="cause">
             <div class="c-top"><span>${esc(c.cause)}</span><span class="conf ${esc(c.confidence)}">${esc(c.confidence)}</span></div>
@@ -480,6 +657,19 @@ function renderReport(r, summary) {
     </div>`;
   $('reportCard').hidden = false;
   $('reportCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// The snapshot the car saved when the code was set.
+function freezeFrameHtml(ff) {
+  if (!ff?.code) return '';
+  const rows = Object.entries(ff).filter(([k]) => k !== 'code').map(([k, v]) => {
+    const d = Object.values(PIDS).find((x) => x.key === k);
+    const unit = /^[°%]/.test(d?.unit || '') ? d.unit : ` ${d?.unit}`;
+    return d ? `<div><span>${esc(d.label)}</span> ${esc(v)}${esc(unit)}</div>` : '';
+  }).join('');
+  return `<h3>When ${esc(ff.code)} was set</h3>
+    <p>${esc(describeFreezeFrame(ff))}</p>
+    <div class="ff-grid">${rows}</div>`;
 }
 
 // Facts straight from the car, shown whatever the AI says.
@@ -523,6 +713,8 @@ function openSettings() {
   $('vYear').value = settings.vehicle.year;
   $('vFuel').value = settings.vehicle.fuel;
   $('fuelUnit').value = settings.fuelUnit;
+  $('fuelPrice').value = settings.fuelPrice ?? '';
+  $('currency').value = settings.currency ?? '';
   syncProviderFields();
   $('settings').showModal();
 }
@@ -539,6 +731,8 @@ function applySettings() {
     openaiKey: $('openaiKey').value.trim(),
     openaiModel: $('openaiModel').value.trim() || DEFAULT_SETTINGS.openaiModel,
     fuelUnit: $('fuelUnit').value,
+    fuelPrice: Number($('fuelPrice').value) > 0 ? Number($('fuelPrice').value) : null,
+    currency: $('currency').value.trim(),
     vehicle: {
       make: $('vMake').value.trim() || 'Unknown',
       model: $('vModel').value.trim() || 'Unknown',
@@ -548,6 +742,7 @@ function applySettings() {
   };
   saveSettings();
   renderVehicle();
+  renderTrips();
   if (elm) {
     fuel.canEstimate = settings.vehicle.fuel !== 'diesel';
     buildGauges();
@@ -578,6 +773,21 @@ function init() {
     if (wasLive) toggleLive();
   });
   $('battBtn').addEventListener('click', runBattery);
+  $('tripBtn').addEventListener('click', toggleTrip);
+  $('tripsExport').addEventListener('click', exportTrips);
+  $('tripsClear').addEventListener('click', () => {
+    if (confirm('Delete all saved trips? This cannot be undone.')) { saveTrips([]); renderTrips(); }
+  });
+  $('tripsList').addEventListener('click', (e) => {
+    const i = e.target.closest('.tr-del')?.dataset.i;
+    if (i == null) return;
+    const list = loadTrips();
+    list.splice(Number(i), 1);
+    saveTrips(list);
+    renderTrips();
+  });
+  $('lookupForm').addEventListener('submit', lookupCode);
+  document.addEventListener('visibilitychange', () => { if (trip && document.visibilityState === 'visible') keepAwake(true); });
   $('battCancel').addEventListener('click', () => batteryAbort?.abort());
   $('checkBtn').addEventListener('click', runCheck);
   $('cancelBtn').addEventListener('click', () => checkAbort?.abort());

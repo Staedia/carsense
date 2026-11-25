@@ -6,7 +6,8 @@
 import {
   PIDS, decodeMonitorStatus, decodeSupportedBitmap, parseMode06Records, decodeVin, hex2,
 } from './pids.js';
-import { parseDtcBytes } from './dtc.js';
+import { parseDtcBytes, decodeDtc } from './dtc.js';
+import { FREEZE_PIDS } from './freeze-frame.js';
 
 const ERRORS = [
   'NO DATA', 'UNABLE TO CONNECT', 'CAN ERROR', 'BUS ERROR', 'BUS BUSY',
@@ -209,6 +210,44 @@ export class Elm327 {
     }
     if (recent.every((v) => v == null) && avg10.every((v) => v == null)) return null;
     return { cylinders, recent, avg10 };
+  }
+
+  /**
+   * Freeze frame 0 (Mode 02): the sensor snapshot saved when a code set.
+   * Returns { code, values: { coolant_temp_c: 88, ... } } or null.
+   */
+  async readFreezeFrame() {
+    // Mode 02 replies echo the PID and frame number: 42 <pid> 00 <data>.
+    const read = async (pid) => {
+      const lines = await this.command(`02${hex2(pid)}00`, 3000);
+      if (findError(lines)) return null;
+      for (const bytes of parseResponses(lines)) {
+        if (bytes[0] === 0x42 && bytes[1] === pid) return bytes.length >= 4 && bytes[2] === 0x00 ? bytes.slice(3) : bytes.slice(2);
+      }
+      return null;
+    };
+    const dtc = await read(0x02);
+    if (!dtc || dtc.length < 2 || (dtc[0] === 0 && dtc[1] === 0)) return null;
+    const code = decodeDtc(dtc[0], dtc[1]);
+
+    // Which PIDs did the car save? Fall back to the live list if it won't say.
+    const supported = new Set();
+    for (const base of [0x00, 0x20]) {
+      if (base && !supported.has(base)) break;
+      const map = await read(base);
+      if (!map || map.length < 4) break;
+      decodeSupportedBitmap(base, map.slice(0, 4)).forEach((x) => supported.add(x));
+    }
+    const pids = FREEZE_PIDS.filter((x) => (supported.size ? supported.has(x) : this.supports(x)));
+
+    const values = {};
+    for (const pid of pids) {
+      const data = await read(pid);
+      if (!data?.length) continue;
+      const v = PIDS[pid].decode(data);
+      if (Number.isFinite(v)) values[PIDS[pid].key] = v;
+    }
+    return { code, values };
   }
 
   /** Vehicle Identification Number (Mode 09), or null if the car won't say. */
