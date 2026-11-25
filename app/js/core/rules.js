@@ -3,6 +3,8 @@
 // fails. Produces the same report shape as the AI.
 
 import { assessBattery } from './battery.js';
+import { explainDtc } from './dtc-library.js';
+import { describeFreezeFrame } from './freeze-frame.js';
 
 // Which cylinder (if any) the car's own misfire counter singles out.
 export function misfireOutlier(mc) {
@@ -181,18 +183,41 @@ export function ruleBasedReport(summary) {
     });
   }
 
-  // Any code not explained by a rule above becomes its own finding.
+  // Any code not explained by a rule above becomes its own finding, using
+  // the offline code library for meaning, seriousness and what to check.
   const explained = new Set(findings.flatMap((f) => f.codes));
+  const SEV = { stop: 3, high: 2, medium: 1, low: 1 };
   for (const c of [...summary.trouble_codes.stored, ...summary.trouble_codes.pending]) {
     if (explained.has(c.code)) continue;
     explained.add(c.code);
     const pendingOnly = !summary.trouble_codes.stored.some((s) => s.code === c.code);
+    const fam = explainDtc(c.code)?.family;
+    const known = fam && fam.severity;
     findings.push({
-      severity: 1, confidence: 'medium', codes: [c.code],
-      cause: `${c.code}: ${c.description}`,
-      reason: pendingOnly ? 'Pending code: the car has seen this once but not confirmed it yet.' : 'Stored trouble code.',
-      checks: [`Look up ${c.code} for your exact model; the AI analysis can explain it in detail`],
+      severity: known ? SEV[fam.severity] : 1, confidence: 'medium', codes: [c.code],
+      cause: `${c.code}: ${known ? fam.name : c.description}`,
+      reason: [
+        known ? fam.meaning : null,
+        pendingOnly ? 'Pending code: the car has seen this once but not confirmed it yet.' : null,
+      ].filter(Boolean).join(' ') || 'Stored trouble code.',
+      checks: known ? fam.checks : (fam?.checks?.length ? fam.checks : [`Look up ${c.code} for your exact model; the AI analysis can explain it in detail`]),
     });
+    if (known && fam.drive === 'no') {
+      drive = 'no';
+      driveNote = fam.note || fam.meaning;
+      safety ??= `${c.code}: ${fam.name}. ${fam.checks[0]}.`;
+    } else if (known && fam.drive === 'with caution' && drive === 'yes') {
+      drive = 'with caution';
+      driveNote = fam.note || 'Get this checked soon and avoid long trips until then.';
+    }
+  }
+
+  // Say when the code was set, from the freeze frame snapshot.
+  const ff = summary.freeze_frame;
+  if (ff?.code) {
+    const when = describeFreezeFrame(ff);
+    const f = findings.find((x) => x.codes.includes(ff.code));
+    if (when && f) f.reason = `${f.reason} ${ff.code} was ${when.charAt(0).toLowerCase()}${when.slice(1)}`;
   }
 
   findings.sort((a, b) => b.severity - a.severity);

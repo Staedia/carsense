@@ -1,5 +1,8 @@
 // Diagnostic Trouble Codes (DTCs): decoding the two-byte format and a
-// lookup table of common generic (SAE) powertrain codes.
+// lookup table of common generic (SAE) powertrain codes. The fuller offline
+// library with plain-English explanations is in dtc-library.js.
+
+import { explainDtc } from './dtc-library.js';
 
 const LETTERS = ['P', 'C', 'B', 'U'];
 
@@ -129,6 +132,8 @@ const FAMILY = {
 };
 
 export function describeDtc(code) {
+  const lib = explainDtc(code);
+  if (lib?.known) return { code, description: lib.title, known: true };
   if (KNOWN[code]) return { code, description: KNOWN[code], known: true };
   const family = FAMILY[code.slice(0, 2)] || 'Trouble code';
   return { code, description: `${family} (not in local table)`, known: false };

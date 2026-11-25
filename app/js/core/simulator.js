@@ -60,6 +60,7 @@ const BASE = {
 
 // Defaults for the extra data each scenario can override.
 const BASE_EXTRAS = {
+  freezeFrame: null, // { code, values } saved when a code set
   incomplete: [], // readiness monitors not finished yet
   misfire: { recent: [0, 1, 0, 0], avg10: [0, 0, 0, 0] },
   battery: { rest: 12.45, crankMin: 10.3 }, // ignition on, engine off
@@ -89,6 +90,10 @@ export const SCENARIOS = {
     label: 'Running lean (P0171)',
     description: 'Positive fuel trims and a lean code, like a vacuum leak or dirty air flow sensor.',
     stored: ['P0171'], pending: [], milOn: true,
+    freezeFrame: {
+      code: 'P0171',
+      values: { coolant_temp_c: 89, rpm: 790, speed_kmh: 0, engine_load_pct: 21, short_term_fuel_trim_pct: 10.2, long_term_fuel_trim_pct: 14.1, throttle_pct: 14.5, intake_map_kpa: 34, maf_gps: 2.3, intake_air_temp_c: 33, module_voltage_v: 14.2, timing_advance_deg: 9 },
+    },
     signals: {
       short_term_fuel_trim_pct: (t, n) => 9.5 + n(3),
       long_term_fuel_trim_pct: (t, n) => 12.5 + n(0.4),
@@ -101,6 +106,10 @@ export const SCENARIOS = {
     description: 'Shaky idle and a cylinder 2 misfire code, like a worn spark plug or bad coil.',
     stored: ['P0302'], pending: ['P0300'], milOn: true,
     misfire: { recent: [3, 187, 1, 0], avg10: [1, 46, 0, 0] },
+    freezeFrame: {
+      code: 'P0302',
+      values: { coolant_temp_c: 87, rpm: 2210, speed_kmh: 64, engine_load_pct: 47, short_term_fuel_trim_pct: 4.7, long_term_fuel_trim_pct: 2.3, throttle_pct: 22, intake_map_kpa: 58, maf_gps: 14.6, intake_air_temp_c: 31, module_voltage_v: 14.1, timing_advance_deg: 18.5 },
+    },
     signals: {
       rpm: (t, n) => 760 + n(55) - (Math.sin(t * 1.9) > 0.85 ? 140 : 0),
       engine_load_pct: (t, n) => 20 + n(3),
@@ -147,6 +156,10 @@ export const SCENARIOS = {
     label: 'Worn catalytic converter (P0420)',
     description: 'Rear O2 sensor copies the front one, a classic sign the catalyst is tired.',
     stored: ['P0420'], pending: [], milOn: true,
+    freezeFrame: {
+      code: 'P0420',
+      values: { coolant_temp_c: 92, rpm: 2480, speed_kmh: 102, engine_load_pct: 38, short_term_fuel_trim_pct: 0.8, long_term_fuel_trim_pct: 2.3, throttle_pct: 19, intake_map_kpa: 52, maf_gps: 16.8, intake_air_temp_c: 29, module_voltage_v: 14.2, timing_advance_deg: 22 },
+    },
     signals: {
       o2_b1s2_v: (t, n) => 0.45 + 0.32 * Math.sin(t * 2.9 - 0.4) + n(0.04),
       distance_with_mil_km: () => 1430,
@@ -298,6 +311,17 @@ export class SimulatedElm {
     if (mode === '04') {
       this.scenario = { ...this.scenario, stored: [], pending: [], milOn: false };
       return [...out, '44'];
+    }
+    if (mode === '02' && c.length === 6) {
+      const pid = parseInt(c.slice(2, 4), 16);
+      const ff = this.scenario.freezeFrame;
+      if (pid === 0x02) return [...out, this._fmt([0x42, 0x02, 0x00, ...(ff ? encodeDtc(ff.code) : [0, 0])])];
+      if (!ff) return [...out, 'NO DATA'];
+      const saved = Object.entries(PIDS).filter(([, d]) => d.key in ff.values).map(([p]) => Number(p));
+      if (pid === 0x00) return [...out, this._fmt([0x42, 0x00, 0x00, ...encodeSupportedBitmap(0x00, [0x02, ...saved])])];
+      const def = PIDS[pid];
+      if (!def || !(def.key in ff.values)) return [...out, 'NO DATA'];
+      return [...out, this._fmt([0x42, pid, 0x00, ...def.encode(ff.values[def.key])])];
     }
     if (c === '06A0') {
       const cyl = this.scenario.misfire.recent.length; // MIDs A1 (all) + A2.. per cylinder

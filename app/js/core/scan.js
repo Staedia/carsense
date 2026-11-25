@@ -4,6 +4,7 @@
 
 import { PIDS, defByKey } from './pids.js';
 import { describeDtc } from './dtc.js';
+import { freezeFrameSummary } from './freeze-frame.js';
 
 // Live sensors worth polling on a petrol engine, most useful first.
 export const LIVE_PIDS = [
@@ -91,7 +92,7 @@ function switches(points) {
 }
 
 export function summarize({
-  vehicle, vin, monitor, stored, pending, once, live, misfire, batteryTest, userNote,
+  vehicle, vin, monitor, stored, pending, once, live, misfire, batteryTest, freezeFrame, userNote,
 }) {
   const readings = {};
   for (const [key, points] of Object.entries(live.series)) {
@@ -141,6 +142,7 @@ export function summarize({
     snapshot,
     emissions_self_tests: selfTests || null,
   };
+  if (freezeFrame) out.freeze_frame = freezeFrameSummary(freezeFrame);
   if (misfire) {
     out.misfire_counts = {
       // index 0 = cylinder 1
@@ -168,6 +170,7 @@ export async function runHealthCheck(elm, {
   const stored = await elm.readDtcs('03');
   const pending = await elm.readDtcs('07');
   const vin = await elm.readVin().catch(() => null);
+  const freezeFrame = stored.length || pending.length ? await elm.readFreezeFrame().catch(() => null) : null;
 
   onStage?.('Reading misfire counters');
   const misfire = await elm.readMisfireCounts().catch(() => null);
@@ -186,6 +189,6 @@ export async function runHealthCheck(elm, {
     throw new Error('No live data came back from the car. Is the engine running?');
   }
   return summarize({
-    vehicle, vin, monitor, stored, pending, once, live, misfire, batteryTest, userNote,
+    vehicle, vin, monitor, stored, pending, once, live, misfire, batteryTest, freezeFrame, userNote,
   });
 }

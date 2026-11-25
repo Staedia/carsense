@@ -12,6 +12,7 @@ You receive a JSON summary of an OBD-II scan: vehicle details, check-engine-ligh
 - misfire_counts: the engine computer's own per-cylinder misfire counters (Mode 06). Index 0 is cylinder 1 (on a few makes the order follows firing order). Near zero is normal; one cylinder far above the others points to that cylinder's plug, coil or injector, even with no code yet.
 - battery_test: a test the driver ran with the engine off then starting. resting_v (engine off), cranking_min_v (lowest during starting), charging_v (engine running). Measured by the dongle at the OBD port, accurate to about ±0.2 V.
 - readings.adapter_voltage_v: battery voltage measured by the dongle, used when the car doesn't report it.
+- freeze_frame: the sensor snapshot the engine computer saved when the code named in freeze_frame.code was set (coolant temperature, rpm, speed, load, fuel trims...). Use it to say under what conditions the fault happens (cold engine, idle, highway speed, heavy load).
 
 Your job:
 1. Give an overall health status: "Good", "Watch", or "Needs attention".
